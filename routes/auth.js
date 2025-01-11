@@ -1,18 +1,23 @@
-// routes/auth.js
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const redis = require('redis');
 const User = require('../models/User');
 const { body, validationResult } = require('express-validator');
-const speakeasy = require('speakeasy');
-const nodemailer = require('nodemailer');
-const twilio = require('twilio');
-const QRCode = require('qrcode');
 const dotenv = require('dotenv');
+const { authenticateToken, saveToken, deleteToken } = require('../middleware/auth');
 
 dotenv.config();
 
 const router = express.Router();
+
+// Initialize Redis client
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL,
+  password: process.env.REDIS_PASSWORD,
+});
+
+redisClient.on('error', (err) => console.error('Redis error:', err));
 
 /**
  * @swagger
@@ -68,7 +73,12 @@ router.post('/register', [
     });
 
     await user.save();
-    res.status(201).json({ message: 'User created successfully' });
+
+    // Generate JWT
+    const token = jwt.sign({ userId: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    saveToken(token, 3600);
+
+    res.status(201).json({ message: 'User created successfully', token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
@@ -77,7 +87,7 @@ router.post('/register', [
 
 /**
  * @swagger
- * /api/login:
+ * /login:
  *   post:
  *     summary: User login
  *     description: User logs in with email and password and receives a JWT token.
@@ -131,14 +141,10 @@ router.post('/login', [
       return res.status(400).json({ message: 'Invalid credentials' });
     }
 
-    if (user.twoFactorEnabled) {
-      const secret = speakeasy.generateSecret();
-      user.twoFactorSecret = secret.base32;
-      await user.save();
-      return res.json({ message: '2FA enabled', secret: secret.base32 });
-    }
-
+    // Generate JWT
     const token = jwt.sign({ userId: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    saveToken(token, 3600);
+
     res.json({ message: 'Login successful', token });
   } catch (err) {
     console.error(err);
@@ -148,58 +154,38 @@ router.post('/login', [
 
 /**
  * @swagger
- * /api/verify-2fa:
+ * /logout:
  *   post:
- *     summary: Verify 2FA code
- *     description: User submits a 2FA code to verify identity.
+ *     summary: Logout user
+ *     description: Invalidates the JWT token.
  *     tags: [Authentication]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               email:
- *                 type: string
- *                 example: user@example.com
- *               token:
- *                 type: string
- *                 example: "123456"
  *     responses:
  *       200:
- *         description: 2FA code verified successfully.
- *       400:
- *         description: Invalid 2FA code.
+ *         description: Logout successful.
  */
-router.post('/verify-2fa', [
-  body('email').isEmail(),
-  body('token').notEmpty(),
-], async (req, res) => {
-  const { email, token } = req.body;
-
-  try {
-    const user = await User.findOne({ email });
-    if (!user || !user.twoFactorSecret) {
-      return res.status(400).json({ message: 'User not found or 2FA not enabled' });
-    }
-
-    const isValid = speakeasy.totp.verify({
-      secret: user.twoFactorSecret,
-      encoding: 'base32',
-      token,
-    });
-
-    if (!isValid) {
-      return res.status(400).json({ message: 'Invalid 2FA token' });
-    }
-
-    const authToken = jwt.sign({ userId: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1h' });
-    res.json({ message: '2FA verified', token: authToken });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+router.post('/logout', authenticateToken, (req, res) => {
+  const token = req.header('Authorization')?.split(' ')[1];
+  if (token) {
+    deleteToken(token);
   }
+  res.json({ message: 'Logout successful.' });
+});
+
+/**
+ * @swagger
+ * /protected:
+ *   get:
+ *     summary: Protected API endpoint
+ *     description: Access this route only with a valid JWT token.
+ *     tags: [Protected]
+ *     responses:
+ *       200:
+ *         description: Access granted.
+ *       401:
+ *         description: Unauthorized, token missing or invalid.
+ */
+router.get('/protected', authenticateToken, (req, res) => {
+  res.json({ message: 'Access granted. This is a protected route.', user: req.user });
 });
 
 module.exports = router;
